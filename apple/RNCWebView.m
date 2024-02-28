@@ -5,7 +5,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-#import "RNCWebViewImpl.h"
+#import "RNCWebView.h"
 #import <React/RCTConvert.h>
 #import <React/RCTAutoInsetsProtocol.h>
 #import "RNCWKProcessPoolManager.h"
@@ -48,86 +48,49 @@ NSString *const CUSTOM_SELECTOR = @"_CUSTOM_SELECTOR_";
 @end
 #endif // !TARGET_OS_OSX
 
+#if TARGET_OS_OSX
 @interface RNCWKWebView : WKWebView
-#if !TARGET_OS_OSX
-@property (nonatomic, copy) NSArray<NSDictionary *> * _Nullable menuItems;
-@property (nonatomic, copy) NSArray<NSString *> * _Nullable suppressMenuItems;
-#endif // !TARGET_OS_OSX
 @end
 @implementation RNCWKWebView
-#if !TARGET_OS_OSX
-- (NSString *)stringFromAction:(SEL) action {
-  NSString *sel = NSStringFromSelector(action);
-
-  NSDictionary *map = @{
-      @"cut:":               @"cut",
-      @"copy:":              @"copy",
-      @"paste:":             @"paste",
-      @"delete:":            @"delete",
-      @"select:":             @"select",
-      @"selectAll:":         @"selectAll",
-      @"_promptForReplace:": @"replace",
-      @"_define:":           @"lookup",
-      @"_translate:":        @"translate",
-      @"toggleBoldface:":    @"bold",
-      @"toggleItalics:":     @"italic",
-      @"toggleUnderline:":   @"underline",
-      @"_share:":            @"share",
-  };
-    
-  return map[sel] ?: sel;
-}
-
-- (BOOL)canPerformAction:(SEL)action
-              withSender:(id)sender{
-  if(self.suppressMenuItems) {
-      NSString * sel = [self stringFromAction:action];
-      if ([self.suppressMenuItems containsObject: sel]) {
-          return NO;
-      }
-  }
-  
-  if (!self.menuItems) {
-      return [super canPerformAction:action withSender:sender];
-  }
-
-  return NO;
-}
-- (void)buildMenuWithBuilder:(id<UIMenuBuilder>)builder API_AVAILABLE(ios(13.0))  {
-    if (@available(iOS 16.0, *)) {
-      if(self.menuItems){
-        [builder removeMenuForIdentifier:UIMenuLookup];
-      }
-    }
-    [super buildMenuWithBuilder:builder];
-}
-#else // TARGET_OS_OSX
 - (void)scrollWheel:(NSEvent *)theEvent {
-  RNCWebViewImpl *rncWebView = (RNCWebViewImpl *)[self superview];
-  RCTAssert([rncWebView isKindOfClass:[rncWebView class]], @"superview must be an RNCWebViewImpl");
+  RNCWebView *rncWebView = (RNCWebView *)[self superview];
+  RCTAssert([rncWebView isKindOfClass:[rncWebView class]], @"superview must be an RNCWebView");
   if (![rncWebView scrollEnabled]) {
     [[self nextResponder] scrollWheel:theEvent];
     return;
   }
   [super scrollWheel:theEvent];
 }
-#endif // TARGET_OS_OSX
 @end
+#endif // TARGET_OS_OSX
 
-@interface RNCWebViewImpl () <WKUIDelegate, WKNavigationDelegate, WKScriptMessageHandler, WKHTTPCookieStoreObserver,
+@interface RNCWebView () <WKUIDelegate, WKNavigationDelegate, WKScriptMessageHandler,
 #if !TARGET_OS_OSX
 UIScrollViewDelegate,
 #endif // !TARGET_OS_OSX
 RCTAutoInsetsProtocol>
 
+@property (nonatomic, copy) RCTDirectEventBlock onFileDownload;
+@property (nonatomic, copy) RCTDirectEventBlock onLoadingStart;
+@property (nonatomic, copy) RCTDirectEventBlock onLoadingFinish;
+@property (nonatomic, copy) RCTDirectEventBlock onLoadingError;
+@property (nonatomic, copy) RCTDirectEventBlock onLoadingProgress;
+@property (nonatomic, copy) RCTDirectEventBlock onShouldStartLoadWithRequest;
+@property (nonatomic, copy) RCTDirectEventBlock onHttpError;
+@property (nonatomic, copy) RCTDirectEventBlock onMessage;
+@property (nonatomic, copy) RCTDirectEventBlock onScroll;
+@property (nonatomic, copy) RCTDirectEventBlock onContentProcessDidTerminate;
+#if !TARGET_OS_OSX
+@property (nonatomic, copy) WKWebView *webView;
+#else
 @property (nonatomic, copy) RNCWKWebView *webView;
+#endif // !TARGET_OS_OSX
 @property (nonatomic, strong) WKUserScript *postMessageScript;
-@property (nonatomic, strong) WKUserScript *injectedObjectJsonScript;
 @property (nonatomic, strong) WKUserScript *atStartScript;
 @property (nonatomic, strong) WKUserScript *atEndScript;
 @end
 
-@implementation RNCWebViewImpl
+@implementation RNCWebView
 {
 #if !TARGET_OS_OSX
   UIColor * _savedBackgroundColor;
@@ -243,15 +206,10 @@ RCTAutoInsetsProtocol>
 // Listener for long presses
 - (void)startLongPress:(UILongPressGestureRecognizer *)pressSender
 {
-    if (pressSender.state != UIGestureRecognizerStateEnded || !self.menuItems) {
-        return;
-    }
-    // When a long press ends, bring up our custom UIMenu if defined
-    if (self.menuItems.count == 0) {
-        UIMenuController *menuController = [UIMenuController sharedMenuController];
-        menuController.menuItems = nil;
-        [menuController setMenuVisible:NO animated:YES];
-        return;
+  // When a long press ends, bring up our custom UIMenu
+  if(pressSender.state == UIGestureRecognizerStateEnded) {
+    if (!self.menuItems || self.menuItems.count == 0) {
+      return;
     }
     UIMenuController *menuController = [UIMenuController sharedMenuController];
     NSMutableArray *menuControllerItems = [NSMutableArray arrayWithCapacity:self.menuItems.count];
@@ -262,11 +220,13 @@ RCTAutoInsetsProtocol>
       NSString *sel = [NSString stringWithFormat:@"%@%@", CUSTOM_SELECTOR, menuItemKey];
       UIMenuItem *item = [[UIMenuItem alloc] initWithTitle: menuItemLabel
                                                     action: NSSelectorFromString(sel)];
+
       [menuControllerItems addObject: item];
     }
 
     menuController.menuItems = menuControllerItems;
     [menuController setMenuVisible:YES animated:YES];
+  }
 }
 
 #endif // !TARGET_OS_OSX
@@ -274,9 +234,6 @@ RCTAutoInsetsProtocol>
 - (void)dealloc
 {
   [[NSNotificationCenter defaultCenter] removeObserver:self];
-  if (@available(iOS 11.0, *)) {
-    [self.webView.configuration.websiteDataStore.httpCookieStore removeObserver:self];
-  }
 }
 
 - (void)tappedMenuItem:(NSString *)eventType
@@ -353,35 +310,10 @@ RCTAutoInsetsProtocol>
 - (WKWebView *)webView:(WKWebView *)webView createWebViewWithConfiguration:(WKWebViewConfiguration *)configuration forNavigationAction:(WKNavigationAction *)navigationAction windowFeatures:(WKWindowFeatures *)windowFeatures
 {
   if (!navigationAction.targetFrame.isMainFrame) {
-    NSURL *url = navigationAction.request.URL;
-
-    if (_onOpenWindow) {
-      NSMutableDictionary<NSString *, id> *event = [self baseEvent];
-      [event addEntriesFromDictionary: @{@"targetUrl": url.absoluteString}];
-      _onOpenWindow(event);
-    } else {
-      [webView loadRequest:navigationAction.request];
-    }
+    [webView loadRequest:navigationAction.request];
   }
   return nil;
 }
-
-/**
- * Enables file input on macos, see https://developer.apple.com/documentation/webkit/wkuidelegate/1641952-webview
- */
-#if TARGET_OS_OSX
-- (void)webView:(WKWebView *)webView runOpenPanelWithParameters:(WKOpenPanelParameters *)parameters initiatedByFrame:(WKFrameInfo *)frame completionHandler:(void (^)(NSArray<NSURL *> *URLs))completionHandler
-{
-  NSOpenPanel *openPanel = [NSOpenPanel openPanel];
-  openPanel.allowsMultipleSelection = parameters.allowsMultipleSelection;
-  [openPanel beginSheetModalForWindow:webView.window completionHandler:^(NSInteger result) {
-    if (result == NSModalResponseOK)
-      completionHandler(openPanel.URLs);
-    else
-      completionHandler(nil);
-  }];
-}
-#endif //Target_OS_OSX
 
 - (WKWebViewConfiguration *)setUpWkWebViewConfig
 {
@@ -392,14 +324,6 @@ RCTAutoInsetsProtocol>
     prefs.javaScriptEnabled = NO;
     _prefsUsed = YES;
   }
-#if defined(__IPHONE_OS_VERSION_MAX_ALLOWED) && __IPHONE_OS_VERSION_MAX_ALLOWED >= 130000 /* iOS 13 */
-  if (@available(iOS 13.0, *)) {
-    if (!_fraudulentWebsiteWarningEnabled) {
-        prefs.fraudulentWebsiteWarningEnabled = NO;
-        _prefsUsed = YES;
-    }
-  }
-#endif
   if (_allowUniversalAccessFromFileURLs) {
     [wkWebViewConfig setValue:@TRUE forKey:@"allowUniversalAccessFromFileURLs"];
   }
@@ -461,10 +385,14 @@ RCTAutoInsetsProtocol>
 
 #if !TARGET_OS_OSX
   wkWebViewConfig.allowsInlineMediaPlayback = _allowsInlineMediaPlayback;
+#if WEBKIT_IOS_10_APIS_AVAILABLE
   wkWebViewConfig.mediaTypesRequiringUserActionForPlayback = _mediaPlaybackRequiresUserAction
   ? WKAudiovisualMediaTypeAll
   : WKAudiovisualMediaTypeNone;
   wkWebViewConfig.dataDetectorTypes = _dataDetectorTypes;
+#else
+  wkWebViewConfig.mediaPlaybackRequiresUserAction = _mediaPlaybackRequiresUserAction;
+#endif
 #endif // !TARGET_OS_OSX
 
   if (_applicationNameForUserAgent) {
@@ -478,11 +406,14 @@ RCTAutoInsetsProtocol>
 {
   if (self.window != nil && _webView == nil) {
     WKWebViewConfiguration *wkWebViewConfig = [self setUpWkWebViewConfig];
+#if !TARGET_OS_OSX
+    _webView = [[WKWebView alloc] initWithFrame:self.bounds configuration: wkWebViewConfig];
+#else
     _webView = [[RNCWKWebView alloc] initWithFrame:self.bounds configuration: wkWebViewConfig];
+#endif // !TARGET_OS_OSX
+
     [self setBackgroundColor: _savedBackgroundColor];
 #if !TARGET_OS_OSX
-    _webView.menuItems = _menuItems;
-    _webView.suppressMenuItems = _suppressMenuItems;
     _webView.scrollView.delegate = self;
 #endif // !TARGET_OS_OSX
     _webView.UIDelegate = self;
@@ -504,24 +435,15 @@ RCTAutoInsetsProtocol>
     _webView.allowsBackForwardNavigationGestures = _allowsBackForwardNavigationGestures;
 
     _webView.customUserAgent = _userAgent;
-
-#if !TARGET_OS_OSX
+#if defined(__IPHONE_OS_VERSION_MAX_ALLOWED) && __IPHONE_OS_VERSION_MAX_ALLOWED >= 110000 /* __IPHONE_11_0 */
     if ([_webView.scrollView respondsToSelector:@selector(setContentInsetAdjustmentBehavior:)]) {
       _webView.scrollView.contentInsetAdjustmentBehavior = _savedContentInsetAdjustmentBehavior;
     }
-#endif  // !TARGET_OS_OSX
-
+#endif
 #if defined(__IPHONE_OS_VERSION_MAX_ALLOWED) && __IPHONE_OS_VERSION_MAX_ALLOWED >= 130000 /* __IPHONE_13_0 */
     if (@available(iOS 13.0, *)) {
       _webView.scrollView.automaticallyAdjustsScrollIndicatorInsets = _savedAutomaticallyAdjustsScrollIndicatorInsets;
     }
-#endif
-
-#if __MAC_OS_X_VERSION_MAX_ALLOWED >= 130300 || \
-    __IPHONE_OS_VERSION_MAX_ALLOWED >= 160400 || \
-    __TV_OS_VERSION_MAX_ALLOWED >= 160400
-    if (@available(macOS 13.3, iOS 16.4, tvOS 16.4, *))
-      _webView.inspectable = _webviewDebuggingEnabled;
 #endif
 
     [self addSubview:_webView];
@@ -549,38 +471,15 @@ RCTAutoInsetsProtocol>
   _webView.allowsBackForwardNavigationGestures = _allowsBackForwardNavigationGestures;
 }
 
-#if __MAC_OS_X_VERSION_MAX_ALLOWED >= 130300 || \
-    __IPHONE_OS_VERSION_MAX_ALLOWED >= 160400 || \
-    __TV_OS_VERSION_MAX_ALLOWED >= 160400
-- (void)setWebviewDebuggingEnabled:(BOOL)webviewDebuggingEnabled {
-  _webviewDebuggingEnabled = webviewDebuggingEnabled;
-  if (@available(macOS 13.3, iOS 16.4, tvOS 16.4, *))
-      _webView.inspectable = _webviewDebuggingEnabled;
-}
-#endif
-
-#ifdef RCT_NEW_ARCH_ENABLED
-- (void)destroyWebView
-#else
 - (void)removeFromSuperview
-#endif
 {
   if (_webView) {
     [_webView.configuration.userContentController removeScriptMessageHandlerForName:HistoryShimName];
     [_webView.configuration.userContentController removeScriptMessageHandlerForName:MessageHandlerName];
     [_webView removeObserver:self forKeyPath:@"estimatedProgress"];
     [_webView removeFromSuperview];
-    if (@available(iOS 15.0, macOS 12.0, *)) {
-        [_webView pauseAllMediaPlaybackWithCompletionHandler:nil];
-    } else if (@available(iOS 14.5, macOS 11.3, *)) {
-        [_webView suspendAllMediaPlayback:nil];
-    }
 #if !TARGET_OS_OSX
     _webView.scrollView.delegate = nil;
-    if (_menuItems) {
-      UIMenuController *menuController = [UIMenuController sharedMenuController];
-      menuController.menuItems = nil;
-    }
 #endif // !TARGET_OS_OSX
     _webView = nil;
     if (_onContentProcessDidTerminate) {
@@ -589,9 +488,7 @@ RCTAutoInsetsProtocol>
     }
   }
 
-#ifndef RCT_NEW_ARCH_ENABLED
   [super removeFromSuperview];
-#endif
 }
 
 #if !TARGET_OS_OSX
@@ -692,7 +589,7 @@ RCTAutoInsetsProtocol>
 #endif // !TARGET_OS_OSX
 }
 
-#if !TARGET_OS_OSX
+#if defined(__IPHONE_OS_VERSION_MAX_ALLOWED) && __IPHONE_OS_VERSION_MAX_ALLOWED >= 110000 /* __IPHONE_11_0 */
 - (void)setContentInsetAdjustmentBehavior:(UIScrollViewContentInsetAdjustmentBehavior)behavior
 {
   _savedContentInsetAdjustmentBehavior = behavior;
@@ -706,8 +603,7 @@ RCTAutoInsetsProtocol>
     _webView.scrollView.contentOffset = contentOffset;
   }
 }
-#endif // !TARGET_OS_OSX
-
+#endif
 #if defined(__IPHONE_OS_VERSION_MAX_ALLOWED) && __IPHONE_OS_VERSION_MAX_ALLOWED >= 130000 /* __IPHONE_13_0 */
 - (void)setAutomaticallyAdjustsScrollIndicatorInsets:(BOOL)automaticallyAdjustsScrollIndicatorInsets{
   _savedAutomaticallyAdjustsScrollIndicatorInsets = automaticallyAdjustsScrollIndicatorInsets;
@@ -719,7 +615,6 @@ RCTAutoInsetsProtocol>
   }
 }
 #endif
-
 /**
  * This method is called whenever JavaScript running within the web view calls:
  *   - window.webkit.messageHandlers[MessageHandlerName].postMessage
@@ -803,43 +698,31 @@ RCTAutoInsetsProtocol>
   }
 
   NSURLRequest *request = [self requestForSource:_source];
-  __weak WKWebView *webView = _webView;
-  NSString *allowingReadAccessToURL = _allowingReadAccessToURL;
 
   [self syncCookiesToWebView:^{
     // Because of the way React works, as pages redirect, we actually end up
     // passing the redirect urls back here, so we ignore them if trying to load
     // the same url. We'll expose a call to 'reload' to allow a user to load
     // the existing page.
-    if ([request.URL isEqual:webView.URL]) {
+    if ([request.URL isEqual:_webView.URL]) {
       return;
     }
     if (!request.URL) {
       // Clear the webview
-      [webView loadHTMLString:@"" baseURL:nil];
+      [_webView loadHTMLString:@"" baseURL:nil];
       return;
     }
     if (request.URL.host) {
-      [webView loadRequest:request];
+      [_webView loadRequest:request];
     }
     else {
-      NSURL* readAccessUrl = allowingReadAccessToURL ? [RCTConvert NSURL:allowingReadAccessToURL] : request.URL;
-      [webView loadFileURL:request.URL allowingReadAccessToURL:readAccessUrl];
+      NSURL* readAccessUrl = _allowingReadAccessToURL ? [RCTConvert NSURL:_allowingReadAccessToURL] : request.URL;
+      [_webView loadFileURL:request.URL allowingReadAccessToURL:readAccessUrl];
     }
   }];
 }
 
 #if !TARGET_OS_OSX
--(void)setMenuItems:(NSArray<NSDictionary *> *)menuItems {
-    _menuItems = menuItems;
-    _webView.menuItems = menuItems;
-}
-
--(void)setSuppressMenuItems:(NSArray<NSString *> *)suppressMenuItems {
-    _suppressMenuItems = suppressMenuItems;
-    _webView.suppressMenuItems = suppressMenuItems;
-}
-
 -(void)setKeyboardDisplayRequiresUserAction:(BOOL)keyboardDisplayRequiresUserAction
 {
   if (_webView == nil) {
@@ -1033,7 +916,7 @@ RCTAutoInsetsProtocol>
 {
   [super layoutSubviews];
 
-  // Ensure webview takes the position and dimensions of RNCWebViewImpl
+  // Ensure webview takes the position and dimensions of RNCWebView
   _webView.frame = self.bounds;
 #if !TARGET_OS_OSX
   _webView.scrollView.contentInset = _contentInset;
@@ -1072,6 +955,12 @@ RCTAutoInsetsProtocol>
     completionHandler(NSURLSessionAuthChallengeUseCredential, clientAuthenticationCredential);
     return;
   }
+   if (_allowsUnsecureHttps == true) {
+       SecTrustRef trust = [[challenge protectionSpace] serverTrust];
+       NSURLCredential *useCredential = [NSURLCredential credentialForTrust:trust];
+       completionHandler(NSURLSessionAuthChallengeUseCredential, useCredential);
+       return;
+    }
   if ([[challenge protectionSpace] serverTrust] != nil && customCertificatesForHost != nil && host != nil) {
     SecCertificateRef localCertificate = (__bridge SecCertificateRef)([customCertificatesForHost objectForKey:host]);
     if (localCertificate != nil) {
@@ -1240,95 +1129,58 @@ RCTAutoInsetsProtocol>
   decidePolicyForNavigationAction:(WKNavigationAction *)navigationAction
                   decisionHandler:(void (^)(WKNavigationActionPolicy))decisionHandler
 {
-    static NSDictionary<NSNumber *, NSString *> *navigationTypes;
-    static dispatch_once_t onceToken;
+  static NSDictionary<NSNumber *, NSString *> *navigationTypes;
+  static dispatch_once_t onceToken;
 
-    dispatch_once(&onceToken, ^{
-        navigationTypes = @{
-            @(WKNavigationTypeLinkActivated): @"click",
-            @(WKNavigationTypeFormSubmitted): @"formsubmit",
-            @(WKNavigationTypeBackForward): @"backforward",
-            @(WKNavigationTypeReload): @"reload",
-            @(WKNavigationTypeFormResubmitted): @"formresubmit",
-            @(WKNavigationTypeOther): @"other",
-        };
-    });
+  dispatch_once(&onceToken, ^{
+    navigationTypes = @{
+      @(WKNavigationTypeLinkActivated): @"click",
+      @(WKNavigationTypeFormSubmitted): @"formsubmit",
+      @(WKNavigationTypeBackForward): @"backforward",
+      @(WKNavigationTypeReload): @"reload",
+      @(WKNavigationTypeFormResubmitted): @"formresubmit",
+      @(WKNavigationTypeOther): @"other",
+    };
+  });
 
-    WKNavigationType navigationType = navigationAction.navigationType;
-    NSURLRequest *request = navigationAction.request;
-    BOOL isTopFrame = [request.URL isEqual:request.mainDocumentURL];
-    BOOL hasTargetFrame = navigationAction.targetFrame != nil;
+  WKNavigationType navigationType = navigationAction.navigationType;
+  NSURLRequest *request = navigationAction.request;
+  BOOL isTopFrame = [request.URL isEqual:request.mainDocumentURL];
 
-    if (_onOpenWindow && !hasTargetFrame) {
-      // When OnOpenWindow should be called, we want to prevent the navigation
-      // If not prevented, the `decisionHandler` is called first and after that `createWebViewWithConfiguration` is called
-      // In that order the WebView's ref would be updated with the target URL even if `createWebViewWithConfiguration` does not call `loadRequest`
-      // So the WebView's document stays on the current URL, but the WebView's ref is replaced by the target URL
-      // By preventing the navigation here, we also prevent the WebView's ref mutation
-      // The counterpart is that we have to manually call `_onOpenWindow` here, because no navigation means no call to `createWebViewWithConfiguration`
-      NSMutableDictionary<NSString *, id> *event = [self baseEvent];
-      [event addEntriesFromDictionary: @{@"targetUrl": request.URL.absoluteString}];
+  if (_onShouldStartLoadWithRequest) {
+    NSMutableDictionary<NSString *, id> *event = [self baseEvent];
+    if (request.mainDocumentURL) {
+      [event addEntriesFromDictionary: @{
+        @"mainDocumentURL": (request.mainDocumentURL).absoluteString,
+      }];
+    }
+    [event addEntriesFromDictionary: @{
+      @"url": (request.URL).absoluteString,
+      @"navigationType": navigationTypes[@(navigationType)],
+      @"isTopFrame": @(isTopFrame)
+    }];
+    if (![self.delegate webView:self
+      shouldStartLoadForRequest:event
+                   withCallback:_onShouldStartLoadWithRequest]) {
       decisionHandler(WKNavigationActionPolicyCancel);
-      _onOpenWindow(event);
       return;
     }
+  }
 
-    if (_onShouldStartLoadWithRequest) {
-        NSMutableDictionary<NSString *, id> *event = [self baseEvent];
-        int lockIdentifier = [[RNCWebViewDecisionManager getInstance] setDecisionHandler: ^(BOOL shouldStart){
-            dispatch_async(dispatch_get_main_queue(), ^{
-                if (!shouldStart) {
-                    decisionHandler(WKNavigationActionPolicyCancel);
-                    return;
-                }
-                if (self->_onLoadingStart) {
-                    // We have this check to filter out iframe requests and whatnot
-                    if (isTopFrame) {
-                        NSMutableDictionary<NSString *, id> *event = [self baseEvent];
-                        [event addEntriesFromDictionary: @{
-                            @"url": (request.URL).absoluteString,
-                            @"navigationType": navigationTypes[@(navigationType)]
-                        }];
-                        self->_onLoadingStart(event);
-                    }
-                }
-
-                // Allow all navigation by default
-                decisionHandler(WKNavigationActionPolicyAllow);
-            });
-
-        }];
-        if (request.mainDocumentURL) {
-          [event addEntriesFromDictionary: @{
-            @"mainDocumentURL": (request.mainDocumentURL).absoluteString,
-          }];
-        }
-        [event addEntriesFromDictionary: @{
-            @"url": (request.URL).absoluteString,
-            @"navigationType": navigationTypes[@(navigationType)],
-            @"isTopFrame": @(isTopFrame),
-            @"hasTargetFrame": @(hasTargetFrame),
-            @"lockIdentifier": @(lockIdentifier)
-        }];
-        _onShouldStartLoadWithRequest(event);
-        // decisionHandler(WKNavigationActionPolicyAllow);
-        return;
+  if (_onLoadingStart) {
+    // We have this check to filter out iframe requests and whatnot
+    if (isTopFrame) {
+      NSMutableDictionary<NSString *, id> *event = [self baseEvent];
+      [event addEntriesFromDictionary: @{
+        @"url": (request.URL).absoluteString,
+        @"navigationType": navigationTypes[@(navigationType)]
+      }];
+      _onLoadingStart(event);
     }
+  }
 
-    if (_onLoadingStart) {
-        // We have this check to filter out iframe requests and whatnot
-        if (isTopFrame) {
-            NSMutableDictionary<NSString *, id> *event = [self baseEvent];
-            [event addEntriesFromDictionary: @{
-                @"url": (request.URL).absoluteString,
-                @"navigationType": navigationTypes[@(navigationType)]
-            }];
-            _onLoadingStart(event);
-        }
-    }
-
-    // Allow all navigation by default
-    decisionHandler(WKNavigationActionPolicyAllow);
+  // Allow all navigation by default
+  decisionHandler(WKNavigationActionPolicyAllow);
 }
 
 /**
@@ -1369,7 +1221,7 @@ RCTAutoInsetsProtocol>
       }
 
       NSString *disposition = nil;
-      if (@available(iOS 13, macOS 10.15, *)) {
+      if (@available(iOS 13, *)) {
         disposition = [response valueForHTTPHeaderField:@"Content-Disposition"];
       }
       BOOL isAttachment = disposition != nil && [disposition hasPrefix:@"attachment"];
@@ -1481,26 +1333,21 @@ RCTAutoInsetsProtocol>
 - (void)webView:(WKWebView *)webView
 didFinishNavigation:(WKNavigation *)navigation
 {
+  if(_sharedCookiesEnabled && @available(iOS 11.0, *)) {
+    // Write all cookies from WKWebView back to sharedHTTPCookieStorage
+    [webView.configuration.websiteDataStore.httpCookieStore getAllCookies:^(NSArray* cookies) {
+      for (NSHTTPCookie *cookie in cookies) {
+        [[NSHTTPCookieStorage sharedHTTPCookieStorage] setCookie:cookie];
+      }
+    }];
+  }
+
   if (_ignoreSilentHardwareSwitch) {
     [self forceIgnoreSilentHardwareSwitch:true];
   }
 
   if (_onLoadingFinish) {
     _onLoadingFinish([self baseEvent]);
-  }
-}
-
-- (void)cookiesDidChangeInCookieStore:(WKHTTPCookieStore *)cookieStore
-{
-  if (@available(iOS 11.0, *)) {
-    if(_sharedCookiesEnabled) {
-      // Write all cookies from WKWebView back to sharedHTTPCookieStorage
-      [cookieStore getAllCookies:^(NSArray* cookies) {
-        for (NSHTTPCookie *cookie in cookies) {
-          [[NSHTTPCookieStorage sharedHTTPCookieStorage] setCookie:cookie];
-        }
-      }];
-    }
   }
 }
 
@@ -1576,37 +1423,6 @@ didFinishNavigation:(WKNavigation *)navigation
 #endif // !TARGET_OS_OSX
 }
 
-- (void)clearCache:(BOOL)includeDiskFiles
-{
-  NSMutableSet *dataTypes = [NSMutableSet setWithArray:@[
-    WKWebsiteDataTypeMemoryCache,
-    WKWebsiteDataTypeOfflineWebApplicationCache,
-  ]];
-  if (@available(iOS 11.3, *)) {
-    [dataTypes addObject:WKWebsiteDataTypeFetchCache];
-  }
-  if (includeDiskFiles) {
-    [dataTypes addObjectsFromArray:@[
-      WKWebsiteDataTypeDiskCache,
-      WKWebsiteDataTypeSessionStorage,
-      WKWebsiteDataTypeLocalStorage,
-      WKWebsiteDataTypeWebSQLDatabases,
-      WKWebsiteDataTypeIndexedDBDatabases
-    ]];
-  }
-  [self removeData:dataTypes];
-}
-
-- (void)removeData:(NSSet *)dataTypes
-{
-  if (_webView == nil) {
-      return;
-  }
-  NSDate *dateFrom = [NSDate dateWithTimeIntervalSince1970:0];
-
-  [_webView.configuration.websiteDataStore removeDataOfTypes:dataTypes modifiedSince:dateFrom completionHandler:^{}];
-}
-
 #if !TARGET_OS_OSX
 - (void)setBounces:(BOOL)bounces
 {
@@ -1626,33 +1442,6 @@ didFinishNavigation:(WKNavigation *)navigation
   if(_webView != nil){
     [self resetupScripts:_webView.configuration];
   }
-}
-
-- (void)setInjectedJavaScriptObject:(NSString *)source
-{
-  self.injectedObjectJsonScript = [
-    [WKUserScript alloc]
-    initWithSource: [
-      NSString
-      stringWithFormat:
-       @"window.%@ ??= {};"
-      "window.%@.injectedObjectJson = function () {"
-      "  return `%@`;"
-      "};", MessageHandlerName, MessageHandlerName, source
-    ]
-    injectionTime:WKUserScriptInjectionTimeAtDocumentStart
-    /* TODO: For a separate (minor) PR: use logic like this (as react-native-wkwebview does) so that messaging can be used in all frames if desired.
-     *       I am keeping it as YES for consistency with previous behaviour. */
-    // forMainFrameOnly:_messagingEnabledForMainFrameOnly
-    forMainFrameOnly:YES
-  ];
-}
-
-- (void)setEnableApplePay:(BOOL)enableApplePay {
-    _enableApplePay = enableApplePay;
-    if(_webView != nil){
-      [self resetupScripts:_webView.configuration];
-    }
 }
 
 - (void)setInjectedJavaScriptBeforeContentLoaded:(NSString *)source {
@@ -1686,10 +1475,11 @@ didFinishNavigation:(WKNavigation *)navigation
     initWithSource: [
       NSString
       stringWithFormat:
-       @"window.%@ ??= {};"
-      "window.%@.postMessage = function (data) {"
-      "  window.webkit.messageHandlers.%@.postMessage(String(data));"
-      "};", MessageHandlerName, MessageHandlerName, MessageHandlerName
+        @"window.%@ = {"
+      "  postMessage: function (data) {"
+      "    window.webkit.messageHandlers.%@.postMessage(String(data));"
+      "  }"
+      "};", MessageHandlerName, MessageHandlerName
     ]
     injectionTime:WKUserScriptInjectionTimeAtDocumentStart
     /* TODO: For a separate (minor) PR: use logic like this (as react-native-wkwebview does) so that messaging can be used in all frames if desired.
@@ -1706,28 +1496,22 @@ didFinishNavigation:(WKNavigation *)navigation
 
 - (void)writeCookiesToWebView:(NSArray<NSHTTPCookie *>*)cookies completion:(void (^)(void))completion {
   // The required cookie APIs only became available on iOS 11
-  if (@available(iOS 11.0, *)) {
-    if (_sharedCookiesEnabled) {
-      __weak WKWebView *webView = _webView;
-      dispatch_async(dispatch_get_main_queue(), ^{
-        dispatch_group_t group = dispatch_group_create();
-        for (NSHTTPCookie *cookie in cookies) {
-          dispatch_group_enter(group);
-          [webView.configuration.websiteDataStore.httpCookieStore setCookie:cookie completionHandler:^{
-            dispatch_group_leave(group);
-          }];
+  if(_sharedCookiesEnabled && @available(iOS 11.0, *)) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+      dispatch_group_t group = dispatch_group_create();
+      for (NSHTTPCookie *cookie in cookies) {
+        dispatch_group_enter(group);
+        [_webView.configuration.websiteDataStore.httpCookieStore setCookie:cookie completionHandler:^{
+          dispatch_group_leave(group);
+        }];
+      }
+      dispatch_group_notify(group, dispatch_get_main_queue(), ^{
+        if (completion) {
+          completion();
         }
-        dispatch_group_notify(group, dispatch_get_main_queue(), ^{
-          if (completion) {
-            completion();
-          }
-        });
       });
-      return;
-    }
-  }
-
-  if (completion) {
+    });
+  } else if (completion) {
     completion();
   }
 }
@@ -1781,9 +1565,7 @@ didFinishNavigation:(WKNavigation *)navigation
       if(!_incognito && !_cacheEnabled) {
         wkWebViewConfig.websiteDataStore = [WKWebsiteDataStore nonPersistentDataStore];
       }
-      [self syncCookiesToWebView:^{
-        [wkWebViewConfig.websiteDataStore.httpCookieStore addObserver:self];
-      }];
+      [self syncCookiesToWebView:nil];
     } else {
       NSMutableString *script = [NSMutableString string];
 
@@ -1846,9 +1628,6 @@ didFinishNavigation:(WKNavigation *)navigation
   // Whether or not messaging is enabled, add the startup script if it exists.
   if (self.atStartScript) {
     [wkWebViewConfig.userContentController addUserScript:self.atStartScript];
-  }
-  if (self.injectedObjectJsonScript) {
-    [wkWebViewConfig.userContentController addUserScript:self.injectedObjectJsonScript];
   }
 }
 
